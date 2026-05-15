@@ -82,13 +82,19 @@ pub fn run_config_menu() -> Result<()> {
                     // External edit already wrote the file; reload and skip the
                     // normal save path so we don't clobber formatting/comments
                     // the user might have added.
-                    println!("  {GREEN}Reloaded config from disk.{RESET}");
+                    println!("  {GREEN}Applied edits from $EDITOR.{RESET}");
                 }
             }
             12 => {
                 // separator — no-op
             }
-            13 => return save_and_restart(&config, fresh),
+            13 => {
+                if save_and_restart(&config, fresh)? {
+                    return Ok(());
+                }
+                // Validation failed — fall through to next loop iteration,
+                // preserving the in-memory `config` so the user can fix it.
+            }
             14 => {
                 println!("\n  {DIM}Discarded changes.{RESET}");
                 return Ok(());
@@ -175,14 +181,7 @@ fn daemon_status_string() -> String {
 
 fn edit_backend(config: &mut Config) -> Result<()> {
     println!("\n  {BOLD}Backend & API keys{RESET}");
-    let mut new_backend = setup::select_backend(Some(config))?;
-
-    // Map "local" pseudo-value (chosen from the engine sub-menu) to the
-    // canonical engine string — select_backend already does this, but if the
-    // user picked another local engine we keep it.
-    if new_backend == "local" {
-        new_backend = "local-whisper".to_string();
-    }
+    let new_backend = setup::select_backend(Some(config))?;
 
     let (deepgram, groq, openai, local_whisper, asr_sidecar) =
         setup::configure_backend(&new_backend, Some(config))?;
@@ -549,10 +548,14 @@ fn open_in_editor(config: &mut Config) -> Result<bool> {
 
 /// Validate, write, and restart. Called only from the "Save & exit" branch.
 ///
+/// Returns `Ok(true)` on a successful save (caller should exit the menu) and
+/// `Ok(false)` when validation failed (caller should return to the menu while
+/// preserving the in-memory edit buffer).
+///
 /// `fresh` is true when we created the config from defaults (no file on disk
 /// at startup) — in that case we point the user at `whisrs setup` for the
 /// permissions/systemd/keybinding bits we deliberately skipped.
-fn save_and_restart(config: &Config, fresh: bool) -> Result<()> {
+fn save_and_restart(config: &Config, fresh: bool) -> Result<bool> {
     match config.validate() {
         Ok(warnings) => {
             for w in warnings {
@@ -563,8 +566,9 @@ fn save_and_restart(config: &Config, fresh: bool) -> Result<()> {
             println!("\n  {RED}Cannot save — config is invalid:{RESET}");
             println!("    {e}");
             println!("  {DIM}Fix the issue and try again, or pick \"Discard & exit\".{RESET}");
-            // Re-enter the menu by recursing.
-            return run_config_menu();
+            // Signal the caller to re-enter the menu without losing the
+            // in-memory edits the user has already made this session.
+            return Ok(false);
         }
     }
 
@@ -608,7 +612,7 @@ fn save_and_restart(config: &Config, fresh: bool) -> Result<()> {
              udev rules, the systemd unit, and a compositor keybinding.{RESET}"
         );
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Parse a comma-separated list, trimming whitespace and dropping empty entries.

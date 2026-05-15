@@ -150,6 +150,8 @@ fn cmd_restart() -> anyhow::Result<()> {
 
     if use_color {
         println!("{BOLD}Restarting whisrs daemon (systemd)…{RESET}");
+    } else {
+        println!("Restarting whisrs daemon (systemd)…");
     }
 
     match restart_daemon_via_systemd() {
