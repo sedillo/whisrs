@@ -500,7 +500,12 @@ fn get_model_for_backend(config: &Config) -> String {
             .as_ref()
             .map(|g| g.model.clone())
             .unwrap_or_else(|| "whisper-large-v3-turbo".to_string()),
-        "openai-realtime" | "openai" => config
+        "openai-realtime" => config
+            .openai
+            .as_ref()
+            .map(|o| o.model.clone())
+            .unwrap_or_else(|| "gpt-realtime-whisper".to_string()),
+        "openai" => config
             .openai
             .as_ref()
             .map(|o| o.model.clone())

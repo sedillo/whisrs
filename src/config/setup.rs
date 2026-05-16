@@ -298,7 +298,7 @@ pub(crate) fn configure_backend(
                 existing_key,
             )?;
             let model = if backend == "openai-realtime" {
-                "gpt-4o-mini-transcribe".to_string()
+                "gpt-realtime-whisper".to_string()
             } else {
                 let selection = Select::new()
                     .with_prompt("Select OpenAI model")

@@ -53,9 +53,28 @@ struct SessionUpdate {
 
 #[derive(Debug, Serialize)]
 struct SessionConfig {
-    input_audio_format: String,
-    input_audio_transcription: AudioTranscriptionConfig,
-    turn_detection: TurnDetectionConfig,
+    #[serde(rename = "type")]
+    session_type: String,
+    audio: SessionAudioConfig,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionAudioConfig {
+    input: SessionAudioInputConfig,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionAudioInputConfig {
+    format: AudioInputFormatConfig,
+    transcription: AudioTranscriptionConfig,
+    turn_detection: Option<TurnDetectionConfig>,
+}
+
+#[derive(Debug, Serialize)]
+struct AudioInputFormatConfig {
+    #[serde(rename = "type")]
+    format_type: String,
+    rate: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -79,6 +98,13 @@ struct AudioBufferAppend {
     #[serde(rename = "type")]
     msg_type: String,
     audio: String,
+}
+
+/// Client message: input_audio_buffer.commit
+#[derive(Debug, Serialize)]
+struct AudioBufferCommit {
+    #[serde(rename = "type")]
+    msg_type: String,
 }
 
 /// Server message envelope — we parse the `type` field first, then
@@ -113,16 +139,22 @@ impl SessionUpdate {
             language.to_string()
         };
         Self {
-            msg_type: "transcription_session.update".to_string(),
+            msg_type: "session.update".to_string(),
             session: SessionConfig {
-                input_audio_format: "pcm16".to_string(),
-                input_audio_transcription: AudioTranscriptionConfig {
-                    model: model.to_string(),
-                    language: lang,
-                    prompt: clamp_prompt(prompt),
-                },
-                turn_detection: TurnDetectionConfig {
-                    detection_type: "server_vad".to_string(),
+                session_type: "transcription".to_string(),
+                audio: SessionAudioConfig {
+                    input: SessionAudioInputConfig {
+                        format: AudioInputFormatConfig {
+                            format_type: "audio/pcm".to_string(),
+                            rate: 24_000,
+                        },
+                        transcription: AudioTranscriptionConfig {
+                            model: model.to_string(),
+                            language: lang,
+                            prompt: clamp_prompt(prompt),
+                        },
+                        turn_detection: None,
+                    },
                 },
             },
         }
@@ -150,6 +182,14 @@ impl AudioBufferAppend {
         Self {
             msg_type: "input_audio_buffer.append".to_string(),
             audio: base64_audio,
+        }
+    }
+}
+
+impl AudioBufferCommit {
+    fn new() -> Self {
+        Self {
+            msg_type: "input_audio_buffer.commit".to_string(),
         }
     }
 }
@@ -241,14 +281,13 @@ impl TranscriptionBackend for OpenAIRealtimeBackend {
     ) -> anyhow::Result<()> {
         let api_key = self.resolve_api_key()?;
         let model = &config.model;
-        let url = "wss://api.openai.com/v1/realtime?intent=transcription".to_string();
+        let url = "wss://api.openai.com/v1/realtime?intent=transcription";
 
         info!("connecting to OpenAI Realtime API: {url}");
 
         let request = tungstenite::http::Request::builder()
-            .uri(&url)
+            .uri(url)
             .header("Authorization", format!("Bearer {api_key}"))
-            .header("OpenAI-Beta", "realtime=v1")
             .header(
                 "Sec-WebSocket-Key",
                 tungstenite::handshake::client::generate_key(),
@@ -270,7 +309,7 @@ impl TranscriptionBackend for OpenAIRealtimeBackend {
         ws_sink
             .send(tungstenite::Message::Text(session_json.into()))
             .await?;
-        debug!("sent transcription_session.update for model={model}");
+        debug!("sent session.update for transcription model={model}");
 
         // Spawn a task to send audio.
         let send_task = tokio::spawn(async move {
@@ -296,21 +335,20 @@ impl TranscriptionBackend for OpenAIRealtimeBackend {
                 }
             }
 
-            // All real audio sent. Send a short silence burst so the
-            // server VAD detects end-of-speech and triggers transcription
-            // for any remaining buffered audio.
-            debug!("sending silence for VAD end-of-speech detection");
-            let silence_samples = vec![0i16; 12_000]; // 0.5s at 24kHz
-            let silence_b64 = encode_pcm_base64(&silence_samples);
-            let msg = AudioBufferAppend::new(silence_b64);
-            if let Ok(json) = serde_json::to_string(&msg) {
-                ws_sink
+            // All real audio sent. Commit the buffer manually; this replaces
+            // server VAD, which some Realtime transcription models reject.
+            debug!("committing audio buffer for transcription");
+            if let Ok(json) = serde_json::to_string(&AudioBufferCommit::new()) {
+                if ws_sink
                     .send(tungstenite::Message::Text(json.into()))
                     .await
-                    .ok();
+                    .is_err()
+                {
+                    error!("WebSocket commit failed — connection may be closed");
+                }
             }
 
-            // Wait for the server to process remaining audio and send
+            // Wait for the server to process the committed audio and send
             // transcription events, then close the WebSocket. This ends
             // the receive loop via the Close frame.
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
@@ -401,17 +439,25 @@ mod tests {
         let msg = SessionUpdate::new("gpt-4o-mini-transcribe", "en", None);
         let json = serde_json::to_value(&msg).unwrap();
 
-        assert_eq!(json["type"], "transcription_session.update");
-        assert_eq!(json["session"]["input_audio_format"], "pcm16");
+        assert_eq!(json["type"], "session.update");
+        assert_eq!(json["session"]["type"], "transcription");
         assert_eq!(
-            json["session"]["input_audio_transcription"]["model"],
+            json["session"]["audio"]["input"]["format"]["type"],
+            "audio/pcm"
+        );
+        assert_eq!(json["session"]["audio"]["input"]["format"]["rate"], 24000);
+        assert_eq!(
+            json["session"]["audio"]["input"]["transcription"]["model"],
             "gpt-4o-mini-transcribe"
         );
         assert_eq!(
-            json["session"]["input_audio_transcription"]["language"],
+            json["session"]["audio"]["input"]["transcription"]["language"],
             "en"
         );
-        assert_eq!(json["session"]["turn_detection"]["type"], "server_vad");
+        assert_eq!(
+            json["session"]["audio"]["input"]["turn_detection"],
+            serde_json::Value::Null
+        );
     }
 
     #[test]
@@ -420,7 +466,7 @@ mod tests {
         let json = serde_json::to_value(&msg).unwrap();
 
         // "auto" should be converted to empty string and skipped
-        assert!(json["session"]["input_audio_transcription"]
+        assert!(json["session"]["audio"]["input"]["transcription"]
             .get("language")
             .is_none());
     }
@@ -430,7 +476,7 @@ mod tests {
         let msg = SessionUpdate::new("gpt-4o-transcribe", "en", Some("Yocto, Hyprland, NixOS"));
         let json = serde_json::to_value(&msg).unwrap();
         assert_eq!(
-            json["session"]["input_audio_transcription"]["prompt"],
+            json["session"]["audio"]["input"]["transcription"]["prompt"],
             "Yocto, Hyprland, NixOS"
         );
     }
@@ -439,7 +485,7 @@ mod tests {
     fn session_update_without_prompt_omits_field() {
         let msg = SessionUpdate::new("gpt-4o-transcribe", "en", None);
         let json = serde_json::to_value(&msg).unwrap();
-        assert!(json["session"]["input_audio_transcription"]
+        assert!(json["session"]["audio"]["input"]["transcription"]
             .get("prompt")
             .is_none());
     }
@@ -448,7 +494,7 @@ mod tests {
     fn session_update_blank_prompt_omits_field() {
         let msg = SessionUpdate::new("gpt-4o-transcribe", "en", Some("   \t\n  "));
         let json = serde_json::to_value(&msg).unwrap();
-        assert!(json["session"]["input_audio_transcription"]
+        assert!(json["session"]["audio"]["input"]["transcription"]
             .get("prompt")
             .is_none());
     }
