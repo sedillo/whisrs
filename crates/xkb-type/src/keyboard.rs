@@ -24,8 +24,10 @@ macro_rules! warn {
 use crate::keymap::{KeyboardLayout, XkbKeymap};
 use crate::{default_clipboard, ClipboardBackend, KeyTap};
 
-/// Delay after creating the virtual device to let the kernel register it.
-const DEVICE_SETTLE_DELAY: Duration = Duration::from_millis(200);
+/// Delay after creating the virtual device to let X11/Wayland register its
+/// keymap before the first injected key. X11 clients otherwise can process
+/// text before the MappingNotify refresh that makes `<LVL3>` work.
+const DEVICE_SETTLE_DELAY: Duration = Duration::from_secs(1);
 
 /// Virtual keyboard that injects keystrokes via uinput.
 pub struct Keyboard {
@@ -126,6 +128,10 @@ impl Keyboard {
     // Public API
     // -----------------------------------------------------------------------
 
+    pub fn set_key_delay(&mut self, key_delay: Duration) {
+        self.key_delay = key_delay;
+    }
+
     /// Type `text` by injecting keystrokes through the virtual device.
     ///
     /// Characters found in the keymap are typed via direct key events
@@ -217,15 +223,18 @@ impl Keyboard {
 
     /// Press and release a single key, with Shift and/or AltGr held as needed.
     ///
-    /// AltGr is `KEY_RIGHTALT`. Both modifiers can be held together for
-    /// level-3 chars on layouts like `us:intl` (e.g. Shift+AltGr+something
-    /// for less common accented forms).
+    /// AltGr is the keycode XKB exposes for `ISO_Level3_Shift`. On some
+    /// X11 layouts that is a dedicated `<LVL3>` keycode rather than
+    /// `KEY_RIGHTALT`; using the XKB keycode keeps third-level characters
+    /// like `é` working with uinput.
     fn tap_key(&mut self, tap: &KeyTap) -> anyhow::Result<()> {
+        let level3_key = Key::new(self.keymap.level3_keycode());
+
         if tap.shift {
             self.set_modifier(Key::KEY_LEFTSHIFT, true)?;
         }
         if tap.altgr {
-            self.set_modifier(Key::KEY_RIGHTALT, true)?;
+            self.set_modifier(level3_key, true)?;
         }
 
         self.device
@@ -236,7 +245,7 @@ impl Keyboard {
         thread::sleep(self.key_delay);
 
         if tap.altgr {
-            self.set_modifier(Key::KEY_RIGHTALT, false)?;
+            self.set_modifier(level3_key, false)?;
         }
         if tap.shift {
             self.set_modifier(Key::KEY_LEFTSHIFT, false)?;
@@ -247,6 +256,7 @@ impl Keyboard {
 
     /// Release all modifier keys to prevent interference with injected text.
     fn release_all_modifiers(&mut self) -> anyhow::Result<()> {
+        let level3_key = Key::new(self.keymap.level3_keycode());
         let modifiers = [
             Key::KEY_LEFTSHIFT,
             Key::KEY_RIGHTSHIFT,
@@ -254,6 +264,7 @@ impl Keyboard {
             Key::KEY_RIGHTCTRL,
             Key::KEY_LEFTALT,
             Key::KEY_RIGHTALT,
+            level3_key,
             Key::KEY_LEFTMETA,
             Key::KEY_RIGHTMETA,
         ];
