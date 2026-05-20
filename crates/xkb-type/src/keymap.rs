@@ -4,6 +4,15 @@ use crate::{KeyMapping, KeyTap};
 use std::collections::HashMap;
 use std::process::Command;
 
+// Logging via the `log` crate (only active with `logging` feature),
+// matching the conditional shim used in `keyboard.rs`.
+#[cfg(feature = "logging")]
+use log::debug;
+#[cfg(not(feature = "logging"))]
+macro_rules! debug {
+    ($($arg:tt)*) => {};
+}
+
 #[derive(Debug, Clone)]
 pub struct KeyboardLayout {
     pub layout: String,
@@ -113,13 +122,38 @@ impl KeyboardLayout {
             return None;
         }
 
-        let output = Command::new("setxkbmap").arg("-query").output().ok()?;
+        let output = match Command::new("setxkbmap").arg("-query").output() {
+            Ok(out) => out,
+            Err(_e) => {
+                debug!("setxkbmap probe failed to spawn: {_e}");
+                return None;
+            }
+        };
         if !output.status.success() {
+            debug!(
+                "setxkbmap -query exited non-zero: status={:?}",
+                output.status.code()
+            );
             return None;
         }
 
-        let stdout = String::from_utf8(output.stdout).ok()?;
-        parse_setxkbmap_query(&stdout)
+        let stdout = match String::from_utf8(output.stdout) {
+            Ok(s) => s,
+            Err(_e) => {
+                debug!("setxkbmap -query stdout was not valid utf-8: {_e}");
+                return None;
+            }
+        };
+        let parsed = parse_setxkbmap_query(&stdout);
+        if let Some(_kl) = parsed.as_ref() {
+            debug!(
+                "x11 layout detected via setxkbmap: layout={} variant={}",
+                _kl.layout, _kl.variant
+            );
+        } else {
+            debug!("setxkbmap -query returned no parseable layout");
+        }
+        parsed
     }
 
     fn from_env() -> Option<Self> {
@@ -178,7 +212,12 @@ impl XkbKeymap {
                 detected.variant
             )
         })?;
-        let level3_keycode = find_level3_keycode(&keymap);
+        // Fall back to KEY_RIGHTALT when no dedicated `<LVL3>` key exists
+        // — that's the common case on plain `us`, `de`, etc. where AltGr
+        // *is* RightAlt. Dedicated `<LVL3>` keycodes show up on layouts
+        // like `us:qwerty-fr`.
+        let level3_keycode =
+            find_level3_keycode(&keymap).unwrap_or_else(|| evdev::Key::KEY_RIGHTALT.code());
         let map = build_reverse_map(&keymap);
         Ok(Self {
             map,
@@ -246,30 +285,39 @@ const ACCENTED_VIA_DEAD_KEY: &[(char, char, u32)] = &[
     ('Ç', 'C', KEY_dead_cedilla),
 ];
 
-fn find_level3_keycode(keymap: &xkbcommon::xkb::Keymap) -> u16 {
+/// Scan the keymap for a key whose **base-level** (layout 0, level 0)
+/// keysym is `ISO_Level3_Shift`. Returns the evdev keycode of the first
+/// such key that is **not** `KEY_RIGHTALT` — that's the dedicated
+/// `<LVL3>` key on layouts like `us:qwerty-fr`.
+///
+/// Returns `None` when there is no dedicated `<LVL3>` key (the common
+/// case: `ISO_Level3_Shift` is bound to `KEY_RIGHTALT` itself, or not at
+/// all). Callers fall back to `KEY_RIGHTALT` in that case.
+///
+/// Restricted to layout 0 / level 0 because `ISO_Level3_Shift` is a
+/// modifier and lives at the base level — scanning every level would
+/// occasionally pick up keys that *produce* a Level3 modifier as a
+/// shifted symbol, which is not what we want.
+fn find_level3_keycode(keymap: &xkbcommon::xkb::Keymap) -> Option<u16> {
     let right_alt = evdev::Key::KEY_RIGHTALT.code();
-    let mut fallback = None;
 
     for raw_keycode in keymap.min_keycode().raw()..=keymap.max_keycode().raw() {
         let keycode = xkbcommon::xkb::Keycode::new(raw_keycode);
         let evdev_keycode: u16 = raw_keycode.saturating_sub(8).try_into().unwrap_or(u16::MAX);
 
-        for layout in 0..keymap.num_layouts() {
-            for level in 0..keymap.num_levels_for_key(keycode, layout) {
-                let syms = keymap.key_get_syms_by_level(keycode, layout, level);
-                if !syms.iter().any(|sym| sym.raw() == KEY_ISO_Level3_Shift) {
-                    continue;
-                }
+        // Restrict to layout 0 / level 0 — `ISO_Level3_Shift` is a
+        // modifier at the base level.
+        let syms = keymap.key_get_syms_by_level(keycode, 0, 0);
+        if !syms.iter().any(|sym| sym.raw() == KEY_ISO_Level3_Shift) {
+            continue;
+        }
 
-                if evdev_keycode != right_alt {
-                    return evdev_keycode;
-                }
-                fallback.get_or_insert(evdev_keycode);
-            }
+        if evdev_keycode != right_alt {
+            return Some(evdev_keycode);
         }
     }
 
-    fallback.unwrap_or(right_alt)
+    None
 }
 
 #[allow(non_upper_case_globals)]
@@ -461,10 +509,16 @@ mod tests {
     fn us_qwerty_fr_typeable_via_uinput() {
         let km = XkbKeymap::from_layout(&layout("us", "qwerty-fr")).unwrap();
 
-        assert_eq!(
+        // The real contract: on us:qwerty-fr, AltGr lives behind a
+        // dedicated `<LVL3>` keycode that is *not* KEY_RIGHTALT. The
+        // exact evdev keycode (currently 84 / KEY_KP4) is an XKB-
+        // implementation detail and could shift between xkbcommon
+        // versions, so assert the property rather than the number.
+        assert_ne!(
             km.level3_keycode(),
-            84,
-            "us:qwerty-fr must use the XKB <LVL3> keycode for AltGr, not KEY_RIGHTALT"
+            evdev::Key::KEY_RIGHTALT.code(),
+            "us:qwerty-fr must use the dedicated XKB <LVL3> keycode for \
+             AltGr, not KEY_RIGHTALT"
         );
         assert_key_full(&km, 'é', 17, false, true, "US qwerty-fr");
 

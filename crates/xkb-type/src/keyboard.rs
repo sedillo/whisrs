@@ -24,10 +24,18 @@ macro_rules! warn {
 use crate::keymap::{KeyboardLayout, XkbKeymap};
 use crate::{default_clipboard, ClipboardBackend, KeyTap};
 
-/// Delay after creating the virtual device to let X11/Wayland register its
-/// keymap before the first injected key. X11 clients otherwise can process
-/// text before the MappingNotify refresh that makes `<LVL3>` work.
-const DEVICE_SETTLE_DELAY: Duration = Duration::from_secs(1);
+/// Delay after creating the virtual device on the runtime path (e.g. when
+/// the daemon re-creates the keyboard after an error). Short, because this
+/// runs on the user's typing path — every error-recovery would otherwise
+/// stall typing.
+const DEVICE_SETTLE_DELAY: Duration = Duration::from_millis(200);
+
+/// Longer delay used at daemon startup (prewarm), so X11 has time to
+/// process MappingNotify and attach the new device's keymap before the
+/// first character is typed. Without this, the very first typed character
+/// after boot can race the X11 keymap refresh and drop accented keys
+/// (notably `<LVL3>` characters like `é` on `us:qwerty-fr`).
+const INITIAL_WARMUP_DELAY: Duration = Duration::from_secs(1);
 
 /// Virtual keyboard that injects keystrokes via uinput.
 pub struct Keyboard {
@@ -57,6 +65,21 @@ impl Keyboard {
         let layout = KeyboardLayout::detect();
         let keymap = XkbKeymap::from_layout(&layout)?;
         Self::with_components(keymap, default_clipboard(), key_delay)
+    }
+
+    /// Like [`Keyboard::new`], but uses a longer post-creation settle
+    /// delay suited for the **first** virtual keyboard created in a
+    /// process. Call this from a startup prewarm so X11 has time to
+    /// process MappingNotify and attach the new device's keymap before
+    /// any character is typed.
+    ///
+    /// Subsequent recreates (e.g. on error recovery) should keep using
+    /// [`Keyboard::new`], which uses a shorter settle so the user's
+    /// typing path is not stalled by 1s on every recovery.
+    pub fn new_prewarm(key_delay: Duration) -> anyhow::Result<Self> {
+        let layout = KeyboardLayout::detect();
+        let keymap = XkbKeymap::from_layout(&layout)?;
+        Self::with_components_settle(keymap, default_clipboard(), key_delay, INITIAL_WARMUP_DELAY)
     }
 
     /// Create a virtual keyboard for a specific XKB layout (and optional
@@ -96,6 +119,19 @@ impl Keyboard {
         clipboard: Box<dyn ClipboardBackend>,
         key_delay: Duration,
     ) -> anyhow::Result<Self> {
+        Self::with_components_settle(keymap, clipboard, key_delay, DEVICE_SETTLE_DELAY)
+    }
+
+    /// Same as [`Keyboard::with_components`], but with an explicit
+    /// post-creation settle delay. Kept private — callers should pick
+    /// between [`Keyboard::new`] (short settle, runtime path) and
+    /// [`Keyboard::new_prewarm`] (long settle, startup path).
+    fn with_components_settle(
+        keymap: XkbKeymap,
+        clipboard: Box<dyn ClipboardBackend>,
+        key_delay: Duration,
+        settle: Duration,
+    ) -> anyhow::Result<Self> {
         // Register all key codes we might need (1..=247 covers standard
         // keys; KEY_MAX on Linux is ~767 but codes beyond 247 are rare).
         let mut keys = AttributeSet::<Key>::new();
@@ -111,8 +147,9 @@ impl Keyboard {
             .build()
             .context("failed to build uinput virtual device — check /dev/uinput permissions")?;
 
-        // Give the kernel time to register the new device.
-        thread::sleep(DEVICE_SETTLE_DELAY);
+        // Give the kernel (and on X11, the server) time to register the
+        // new device and refresh its keymap before any keys are sent.
+        thread::sleep(settle);
 
         debug!("uinput virtual keyboard created");
 

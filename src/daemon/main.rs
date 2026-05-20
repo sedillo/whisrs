@@ -1402,7 +1402,11 @@ fn type_text_at_cursor(text: &str, key_delay: std::time::Duration) -> Result<()>
         .map_err(|_| anyhow::anyhow!("keyboard mutex poisoned"))?;
 
     if keyboard_guard.is_none() {
-        *keyboard_guard = Some(new_keyboard(key_delay)?);
+        // Runtime path: short settle delay. The startup prewarm in
+        // `warm_keyboard` is what gives X11 time to attach its keymap;
+        // we don't want every error-recovery to stall the user's typing
+        // path for 1s.
+        *keyboard_guard = Some(new_keyboard(key_delay, /* prewarm = */ false)?);
     }
 
     let keyboard = keyboard_guard
@@ -1429,7 +1433,9 @@ fn warm_keyboard(key_delay: std::time::Duration) {
         return;
     }
 
-    match new_keyboard(key_delay) {
+    // Startup path: long settle delay so X11 has time to process
+    // MappingNotify and attach the device keymap before the first key.
+    match new_keyboard(key_delay, /* prewarm = */ true) {
         Ok(kb) => {
             *keyboard_guard = Some(kb);
             info!("virtual keyboard initialized");
@@ -1440,8 +1446,13 @@ fn warm_keyboard(key_delay: std::time::Duration) {
     }
 }
 
-fn new_keyboard(key_delay: std::time::Duration) -> Result<xkb_type::Keyboard> {
-    match xkb_type::Keyboard::new(key_delay) {
+fn new_keyboard(key_delay: std::time::Duration, prewarm: bool) -> Result<xkb_type::Keyboard> {
+    let result = if prewarm {
+        xkb_type::Keyboard::new_prewarm(key_delay)
+    } else {
+        xkb_type::Keyboard::new(key_delay)
+    };
+    match result {
         Ok(kb) => Ok(kb),
         Err(e) => {
             let msg = format!("{e:#}");
