@@ -24,8 +24,18 @@ macro_rules! warn {
 use crate::keymap::{KeyboardLayout, XkbKeymap};
 use crate::{default_clipboard, ClipboardBackend, KeyTap};
 
-/// Delay after creating the virtual device to let the kernel register it.
+/// Delay after creating the virtual device on the runtime path (e.g. when
+/// the daemon re-creates the keyboard after an error). Short, because this
+/// runs on the user's typing path — every error-recovery would otherwise
+/// stall typing.
 const DEVICE_SETTLE_DELAY: Duration = Duration::from_millis(200);
+
+/// Longer delay used at daemon startup (prewarm), so X11 has time to
+/// process MappingNotify and attach the new device's keymap before the
+/// first character is typed. Without this, the very first typed character
+/// after boot can race the X11 keymap refresh and drop accented keys
+/// (notably `<LVL3>` characters like `é` on `us:qwerty-fr`).
+const INITIAL_WARMUP_DELAY: Duration = Duration::from_secs(1);
 
 /// Virtual keyboard that injects keystrokes via uinput.
 pub struct Keyboard {
@@ -55,6 +65,21 @@ impl Keyboard {
         let layout = KeyboardLayout::detect();
         let keymap = XkbKeymap::from_layout(&layout)?;
         Self::with_components(keymap, default_clipboard(), key_delay)
+    }
+
+    /// Like [`Keyboard::new`], but uses a longer post-creation settle
+    /// delay suited for the **first** virtual keyboard created in a
+    /// process. Call this from a startup prewarm so X11 has time to
+    /// process MappingNotify and attach the new device's keymap before
+    /// any character is typed.
+    ///
+    /// Subsequent recreates (e.g. on error recovery) should keep using
+    /// [`Keyboard::new`], which uses a shorter settle so the user's
+    /// typing path is not stalled by 1s on every recovery.
+    pub fn new_prewarm(key_delay: Duration) -> anyhow::Result<Self> {
+        let layout = KeyboardLayout::detect();
+        let keymap = XkbKeymap::from_layout(&layout)?;
+        Self::with_components_settle(keymap, default_clipboard(), key_delay, INITIAL_WARMUP_DELAY)
     }
 
     /// Create a virtual keyboard for a specific XKB layout (and optional
@@ -94,6 +119,19 @@ impl Keyboard {
         clipboard: Box<dyn ClipboardBackend>,
         key_delay: Duration,
     ) -> anyhow::Result<Self> {
+        Self::with_components_settle(keymap, clipboard, key_delay, DEVICE_SETTLE_DELAY)
+    }
+
+    /// Same as [`Keyboard::with_components`], but with an explicit
+    /// post-creation settle delay. Kept private — callers should pick
+    /// between [`Keyboard::new`] (short settle, runtime path) and
+    /// [`Keyboard::new_prewarm`] (long settle, startup path).
+    fn with_components_settle(
+        keymap: XkbKeymap,
+        clipboard: Box<dyn ClipboardBackend>,
+        key_delay: Duration,
+        settle: Duration,
+    ) -> anyhow::Result<Self> {
         // Register all key codes we might need (1..=247 covers standard
         // keys; KEY_MAX on Linux is ~767 but codes beyond 247 are rare).
         let mut keys = AttributeSet::<Key>::new();
@@ -109,8 +147,9 @@ impl Keyboard {
             .build()
             .context("failed to build uinput virtual device — check /dev/uinput permissions")?;
 
-        // Give the kernel time to register the new device.
-        thread::sleep(DEVICE_SETTLE_DELAY);
+        // Give the kernel (and on X11, the server) time to register the
+        // new device and refresh its keymap before any keys are sent.
+        thread::sleep(settle);
 
         debug!("uinput virtual keyboard created");
 
@@ -125,6 +164,10 @@ impl Keyboard {
     // -----------------------------------------------------------------------
     // Public API
     // -----------------------------------------------------------------------
+
+    pub fn set_key_delay(&mut self, key_delay: Duration) {
+        self.key_delay = key_delay;
+    }
 
     /// Type `text` by injecting keystrokes through the virtual device.
     ///
@@ -217,15 +260,18 @@ impl Keyboard {
 
     /// Press and release a single key, with Shift and/or AltGr held as needed.
     ///
-    /// AltGr is `KEY_RIGHTALT`. Both modifiers can be held together for
-    /// level-3 chars on layouts like `us:intl` (e.g. Shift+AltGr+something
-    /// for less common accented forms).
+    /// AltGr is the keycode XKB exposes for `ISO_Level3_Shift`. On some
+    /// X11 layouts that is a dedicated `<LVL3>` keycode rather than
+    /// `KEY_RIGHTALT`; using the XKB keycode keeps third-level characters
+    /// like `é` working with uinput.
     fn tap_key(&mut self, tap: &KeyTap) -> anyhow::Result<()> {
+        let level3_key = Key::new(self.keymap.level3_keycode());
+
         if tap.shift {
             self.set_modifier(Key::KEY_LEFTSHIFT, true)?;
         }
         if tap.altgr {
-            self.set_modifier(Key::KEY_RIGHTALT, true)?;
+            self.set_modifier(level3_key, true)?;
         }
 
         self.device
@@ -236,7 +282,7 @@ impl Keyboard {
         thread::sleep(self.key_delay);
 
         if tap.altgr {
-            self.set_modifier(Key::KEY_RIGHTALT, false)?;
+            self.set_modifier(level3_key, false)?;
         }
         if tap.shift {
             self.set_modifier(Key::KEY_LEFTSHIFT, false)?;
@@ -247,6 +293,7 @@ impl Keyboard {
 
     /// Release all modifier keys to prevent interference with injected text.
     fn release_all_modifiers(&mut self) -> anyhow::Result<()> {
+        let level3_key = Key::new(self.keymap.level3_keycode());
         let modifiers = [
             Key::KEY_LEFTSHIFT,
             Key::KEY_RIGHTSHIFT,
@@ -254,6 +301,7 @@ impl Keyboard {
             Key::KEY_RIGHTCTRL,
             Key::KEY_LEFTALT,
             Key::KEY_RIGHTALT,
+            level3_key,
             Key::KEY_LEFTMETA,
             Key::KEY_RIGHTMETA,
         ];

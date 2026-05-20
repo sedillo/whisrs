@@ -4,6 +4,15 @@ use crate::{KeyMapping, KeyTap};
 use std::collections::HashMap;
 use std::process::Command;
 
+// Logging via the `log` crate (only active with `logging` feature),
+// matching the conditional shim used in `keyboard.rs`.
+#[cfg(feature = "logging")]
+use log::debug;
+#[cfg(not(feature = "logging"))]
+macro_rules! debug {
+    ($($arg:tt)*) => {};
+}
+
 #[derive(Debug, Clone)]
 pub struct KeyboardLayout {
     pub layout: String,
@@ -16,6 +25,9 @@ impl KeyboardLayout {
             return kl;
         }
         if let Some(kl) = Self::from_sway() {
+            return kl;
+        }
+        if let Some(kl) = Self::from_x11() {
             return kl;
         }
         if let Some(kl) = Self::from_env() {
@@ -71,8 +83,8 @@ impl KeyboardLayout {
     ///
     /// We therefore confirm Sway is reachable (so the function is not
     /// dead code) but always return `None`, letting the caller fall
-    /// through to `from_env`. If a real display-name → XKB-code lookup
-    /// table is added later, this is the place to wire it up.
+    /// through to the next fallback. If a real display-name → XKB-code
+    /// lookup table is added later, this is the place to wire it up.
     fn from_sway() -> Option<Self> {
         let output = Command::new("swaymsg")
             .args(["-t", "get_inputs", "--raw"])
@@ -105,6 +117,45 @@ impl KeyboardLayout {
         None
     }
 
+    fn from_x11() -> Option<Self> {
+        if std::env::var_os("DISPLAY").is_none() || std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            return None;
+        }
+
+        let output = match Command::new("setxkbmap").arg("-query").output() {
+            Ok(out) => out,
+            Err(_e) => {
+                debug!("setxkbmap probe failed to spawn: {_e}");
+                return None;
+            }
+        };
+        if !output.status.success() {
+            debug!(
+                "setxkbmap -query exited non-zero: status={:?}",
+                output.status.code()
+            );
+            return None;
+        }
+
+        let stdout = match String::from_utf8(output.stdout) {
+            Ok(s) => s,
+            Err(_e) => {
+                debug!("setxkbmap -query stdout was not valid utf-8: {_e}");
+                return None;
+            }
+        };
+        let parsed = parse_setxkbmap_query(&stdout);
+        if let Some(_kl) = parsed.as_ref() {
+            debug!(
+                "x11 layout detected via setxkbmap: layout={} variant={}",
+                _kl.layout, _kl.variant
+            );
+        } else {
+            debug!("setxkbmap -query returned no parseable layout");
+        }
+        parsed
+    }
+
     fn from_env() -> Option<Self> {
         let layout = std::env::var("XKB_DEFAULT_LAYOUT").ok()?;
         if layout.is_empty() {
@@ -115,8 +166,31 @@ impl KeyboardLayout {
     }
 }
 
+fn parse_setxkbmap_query(output: &str) -> Option<KeyboardLayout> {
+    let mut layout = None;
+    let mut variant = None;
+
+    for line in output.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        match key.trim() {
+            "layout" => layout = Some(value.trim().to_string()),
+            "variant" => variant = Some(value.trim().to_string()),
+            _ => {}
+        }
+    }
+
+    let layout = layout.filter(|s| !s.is_empty())?;
+    Some(KeyboardLayout {
+        layout,
+        variant: variant.unwrap_or_default(),
+    })
+}
+
 pub struct XkbKeymap {
     map: HashMap<char, KeyMapping>,
+    level3_keycode: u16,
 }
 
 impl XkbKeymap {
@@ -138,12 +212,24 @@ impl XkbKeymap {
                 detected.variant
             )
         })?;
+        // Fall back to KEY_RIGHTALT when no dedicated `<LVL3>` key exists
+        // — that's the common case on plain `us`, `de`, etc. where AltGr
+        // *is* RightAlt. Dedicated `<LVL3>` keycodes show up on layouts
+        // like `us:qwerty-fr`.
+        let level3_keycode =
+            find_level3_keycode(&keymap).unwrap_or_else(|| evdev::Key::KEY_RIGHTALT.code());
         let map = build_reverse_map(&keymap);
-        Ok(Self { map })
+        Ok(Self {
+            map,
+            level3_keycode,
+        })
     }
 
     pub fn lookup(&self, ch: char) -> Option<&KeyMapping> {
         self.map.get(&ch)
+    }
+    pub fn level3_keycode(&self) -> u16 {
+        self.level3_keycode
     }
     pub fn len(&self) -> usize {
         self.map.len()
@@ -154,8 +240,8 @@ impl XkbKeymap {
 }
 
 use xkbcommon::xkb::keysyms::{
-    KEY_dead_acute, KEY_dead_cedilla, KEY_dead_circumflex, KEY_dead_diaeresis, KEY_dead_grave,
-    KEY_dead_tilde,
+    KEY_ISO_Level3_Shift, KEY_dead_acute, KEY_dead_cedilla, KEY_dead_circumflex,
+    KEY_dead_diaeresis, KEY_dead_grave, KEY_dead_tilde,
 };
 
 const ACCENTED_VIA_DEAD_KEY: &[(char, char, u32)] = &[
@@ -198,6 +284,41 @@ const ACCENTED_VIA_DEAD_KEY: &[(char, char, u32)] = &[
     ('ç', 'c', KEY_dead_cedilla),
     ('Ç', 'C', KEY_dead_cedilla),
 ];
+
+/// Scan the keymap for a key whose **base-level** (layout 0, level 0)
+/// keysym is `ISO_Level3_Shift`. Returns the evdev keycode of the first
+/// such key that is **not** `KEY_RIGHTALT` — that's the dedicated
+/// `<LVL3>` key on layouts like `us:qwerty-fr`.
+///
+/// Returns `None` when there is no dedicated `<LVL3>` key (the common
+/// case: `ISO_Level3_Shift` is bound to `KEY_RIGHTALT` itself, or not at
+/// all). Callers fall back to `KEY_RIGHTALT` in that case.
+///
+/// Restricted to layout 0 / level 0 because `ISO_Level3_Shift` is a
+/// modifier and lives at the base level — scanning every level would
+/// occasionally pick up keys that *produce* a Level3 modifier as a
+/// shifted symbol, which is not what we want.
+fn find_level3_keycode(keymap: &xkbcommon::xkb::Keymap) -> Option<u16> {
+    let right_alt = evdev::Key::KEY_RIGHTALT.code();
+
+    for raw_keycode in keymap.min_keycode().raw()..=keymap.max_keycode().raw() {
+        let keycode = xkbcommon::xkb::Keycode::new(raw_keycode);
+        let evdev_keycode: u16 = raw_keycode.saturating_sub(8).try_into().unwrap_or(u16::MAX);
+
+        // Restrict to layout 0 / level 0 — `ISO_Level3_Shift` is a
+        // modifier at the base level.
+        let syms = keymap.key_get_syms_by_level(keycode, 0, 0);
+        if !syms.iter().any(|sym| sym.raw() == KEY_ISO_Level3_Shift) {
+            continue;
+        }
+
+        if evdev_keycode != right_alt {
+            return Some(evdev_keycode);
+        }
+    }
+
+    None
+}
 
 #[allow(non_upper_case_globals)]
 pub(crate) fn build_reverse_map(keymap: &xkbcommon::xkb::Keymap) -> HashMap<char, KeyMapping> {
@@ -370,6 +491,42 @@ mod tests {
         if let Ok(km) = km {
             assert!(!km.is_empty(), "keymap should not be empty");
             assert!(km.lookup('a').is_some(), "'a' should be in the keymap");
+        }
+    }
+
+    #[test]
+    fn parse_x11_setxkbmap_query() {
+        let layout = parse_setxkbmap_query(
+            "rules:      evdev\nmodel:      pc104\nlayout:     us\nvariant:    qwerty-fr\n",
+        )
+        .unwrap();
+
+        assert_eq!(layout.layout, "us");
+        assert_eq!(layout.variant, "qwerty-fr");
+    }
+
+    #[test]
+    fn us_qwerty_fr_typeable_via_uinput() {
+        let km = XkbKeymap::from_layout(&layout("us", "qwerty-fr")).unwrap();
+
+        // The real contract: on us:qwerty-fr, AltGr lives behind a
+        // dedicated `<LVL3>` keycode that is *not* KEY_RIGHTALT. The
+        // exact evdev keycode (currently 84 / KEY_KP4) is an XKB-
+        // implementation detail and could shift between xkbcommon
+        // versions, so assert the property rather than the number.
+        assert_ne!(
+            km.level3_keycode(),
+            evdev::Key::KEY_RIGHTALT.code(),
+            "us:qwerty-fr must use the dedicated XKB <LVL3> keycode for \
+             AltGr, not KEY_RIGHTALT"
+        );
+        assert_key_full(&km, 'é', 17, false, true, "US qwerty-fr");
+
+        for ch in ['ç', 'à', 'é', 'è', 'ù'] {
+            assert!(
+                km.lookup(ch).is_some(),
+                "'{ch}' must be reachable via uinput on us:qwerty-fr"
+            );
         }
     }
 

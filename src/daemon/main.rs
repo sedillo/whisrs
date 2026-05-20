@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -26,6 +26,8 @@ use whisrs::transcription::openai_rest::OpenAIRestBackend;
 use whisrs::transcription::{TranscriptionBackend, TranscriptionConfig};
 use whisrs::window::{self, WindowTracker};
 use whisrs::{encode_message, read_message, socket_path, Command, Config, Response, State};
+
+static KEYBOARD: OnceLock<StdMutex<Option<xkb_type::Keyboard>>> = OnceLock::new();
 
 /// Context saved when command mode starts recording.
 struct CommandModeContext {
@@ -584,6 +586,7 @@ async fn main() -> Result<()> {
     // Wait for compositor environment on boot (WAYLAND_DISPLAY, etc.).
     // Must run before window tracker detection and any clipboard operations.
     import_compositor_env().await;
+    warm_keyboard(std::time::Duration::from_millis(config.input.key_delay_ms));
 
     let window_tracker: Arc<dyn WindowTracker> = Arc::from(window::detect_tracker());
     info!(
@@ -1393,8 +1396,64 @@ fn format_api_error(err: &anyhow::Error) -> String {
 
 /// Type text at the cursor using uinput (keyboard injection) or clipboard paste.
 fn type_text_at_cursor(text: &str, key_delay: std::time::Duration) -> Result<()> {
-    let mut keyboard = match xkb_type::Keyboard::new(key_delay) {
-        Ok(kb) => kb,
+    let keyboard_slot = KEYBOARD.get_or_init(|| StdMutex::new(None));
+    let mut keyboard_guard = keyboard_slot
+        .lock()
+        .map_err(|_| anyhow::anyhow!("keyboard mutex poisoned"))?;
+
+    if keyboard_guard.is_none() {
+        // Runtime path: short settle delay. The startup prewarm in
+        // `warm_keyboard` is what gives X11 time to attach its keymap;
+        // we don't want every error-recovery to stall the user's typing
+        // path for 1s.
+        *keyboard_guard = Some(new_keyboard(key_delay, /* prewarm = */ false)?);
+    }
+
+    let keyboard = keyboard_guard
+        .as_mut()
+        .expect("keyboard exists after initialization");
+    keyboard.set_key_delay(key_delay);
+
+    let result = keyboard.type_text(text).context("failed to type text");
+    if result.is_err() {
+        *keyboard_guard = None;
+    }
+    result?;
+    Ok(())
+}
+
+fn warm_keyboard(key_delay: std::time::Duration) {
+    let keyboard_slot = KEYBOARD.get_or_init(|| StdMutex::new(None));
+    let Ok(mut keyboard_guard) = keyboard_slot.lock() else {
+        warn!("failed to initialize virtual keyboard: keyboard mutex poisoned");
+        return;
+    };
+
+    if keyboard_guard.is_some() {
+        return;
+    }
+
+    // Startup path: long settle delay so X11 has time to process
+    // MappingNotify and attach the device keymap before the first key.
+    match new_keyboard(key_delay, /* prewarm = */ true) {
+        Ok(kb) => {
+            *keyboard_guard = Some(kb);
+            info!("virtual keyboard initialized");
+        }
+        Err(e) => {
+            warn!("failed to initialize virtual keyboard: {e:#}");
+        }
+    }
+}
+
+fn new_keyboard(key_delay: std::time::Duration, prewarm: bool) -> Result<xkb_type::Keyboard> {
+    let result = if prewarm {
+        xkb_type::Keyboard::new_prewarm(key_delay)
+    } else {
+        xkb_type::Keyboard::new(key_delay)
+    };
+    match result {
+        Ok(kb) => Ok(kb),
         Err(e) => {
             let msg = format!("{e:#}");
             if msg.contains("Permission denied") || msg.contains("permission") {
@@ -1403,12 +1462,9 @@ fn type_text_at_cursor(text: &str, key_delay: std::time::Duration) -> Result<()>
                      Fix: sudo usermod -aG input $USER"
                 );
             }
-            return Err(e.context("failed to create virtual keyboard"));
+            Err(e.context("failed to create virtual keyboard"))
         }
-    };
-
-    keyboard.type_text(text).context("failed to type text")?;
-    Ok(())
+    }
 }
 
 fn build_transcription_config(config: &Config) -> TranscriptionConfig {
