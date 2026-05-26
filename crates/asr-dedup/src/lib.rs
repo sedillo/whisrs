@@ -226,12 +226,24 @@ fn floor_char_boundary(s: &str, index: usize) -> usize {
 
 /// Remove overlapping text between the end of `previous` and `new`.
 ///
-/// Uses an anchor-search strategy: takes the last N words of `previous` and
-/// searches for that sequence anywhere in the first 75% of `new`. This handles
-/// whisper's tendency to slightly rephrase overlapping regions (word
-/// insertions/deletions at boundaries) that break strict prefix alignment.
+/// Uses three strategies (tried in order):
 ///
-/// Falls back to prefix alignment for short texts (< 3 words in previous).
+/// 1. Anchor search — takes the last N words of `previous` and searches
+///    for that sequence anywhere in `new`.  Handles whisper inserting or
+///    deleting words anywhere in the overlapping region.  Searches the
+///    entire `new` text (no percentage limit) since the anchor from the
+///    end of `previous` will never appear at the very end of `new` for
+///    legitimate new content.
+///
+/// 2. Longest common prefix (fuzzy fallback).  If anchor search finds
+///    nothing, try matching from the start — whisper.cpp is explicitly
+///    prompted with the previous text, so the new output often starts
+///    with similar words.
+///
+/// 3. Suffix-prefix alignment — checks whether the end of `previous`
+///    matches the start of `new`.
+///
+/// Falls back to returning the full `new` text if no overlap is found.
 pub(crate) fn remove_overlap(previous: &str, new: &str) -> String {
     let prev_words: Vec<&str> = previous.split_whitespace().collect();
     let new_words: Vec<&str> = new.split_whitespace().collect();
@@ -242,15 +254,15 @@ pub(crate) fn remove_overlap(previous: &str, new: &str) -> String {
 
     // --- Strategy 1: Anchor search ---
     // Take the last N words of previous and search for them in the new text.
-    // This handles whisper inserting/removing words at window boundaries.
-    let search_limit = (new_words.len() * 3 / 4).max(1);
+    // Search the entire new text — if the anchor from the end of `previous`
+    // appears, the text after it is genuinely new.
     let max_anchor = prev_words.len().min(8);
 
     for anchor_len in (3..=max_anchor).rev() {
         let anchor = &prev_words[prev_words.len() - anchor_len..];
 
         for pos in 0..new_words.len() {
-            if pos + anchor_len > new_words.len() || pos >= search_limit {
+            if pos + anchor_len > new_words.len() {
                 break;
             }
             let candidate = &new_words[pos..pos + anchor_len];
@@ -264,8 +276,27 @@ pub(crate) fn remove_overlap(previous: &str, new: &str) -> String {
         }
     }
 
-    // --- Strategy 2: Prefix alignment (fallback for short texts) ---
-    // Check if the end of previous matches the start of new exactly.
+    // --- Strategy 2: Longest common prefix (fuzzy fallback) ---
+    // Because whisper is explicitly prompted with the previous output,
+    // the start of the new text often repeats the previous text verbatim.
+    let max_prefix = prev_words.len().min(new_words.len()).min(50);
+    let mut prefix_len = 0;
+    for i in 0..max_prefix {
+        if !words_match(prev_words[i], new_words[i]) {
+            break;
+        }
+        prefix_len = i + 1;
+    }
+    if prefix_len > 0 {
+        let remaining = &new_words[prefix_len..];
+        if remaining.is_empty() {
+            return String::new();
+        }
+        return remaining.join(" ");
+    }
+
+    // --- Strategy 3: Suffix-prefix alignment ---
+    // Check if the end of previous matches the start of new.
     let max_overlap = prev_words.len().min(new_words.len()).min(50);
     for overlap_len in (1..=max_overlap).rev() {
         let prev_suffix = &prev_words[prev_words.len() - overlap_len..];
