@@ -925,50 +925,62 @@ async fn handle_toggle(
                         .map(|t| t.elapsed().as_secs_f64())
                         .unwrap_or(0.0);
                     let mut ds = daemon_state.lock().await;
-                    match ds.state_machine.transition(Action::TranscriptionDone) {
-                        Ok(new_state) => {
-                            // Broadcast idle state for tray.
-                            let _ = context.state_tx.send(new_state);
-                            if let Some(level_tx) = &context.overlay_level_tx {
-                                let _ = level_tx.send(0.0);
-                            }
-                            match result {
-                                Ok(text) => {
-                                    info!("transcription complete: {} chars", text.len());
-                                    if !text.is_empty() {
-                                        save_history_entry(
-                                            &text,
-                                            &context.config.general.backend,
-                                            &context.config.general.language,
-                                            duration_secs,
-                                        );
-                                    }
-                                    if context.config.general.audio_feedback {
-                                        feedback::play_done(
-                                            context.config.general.audio_feedback_volume,
-                                        );
-                                    }
-                                    if context.notify_state() {
-                                        let preview = truncate_preview(&text, 77);
-                                        send_notification("whisrs", &format!("Done: {preview}"));
-                                    }
-                                    Response::Ok { state: new_state }
-                                }
-                                Err(e) => {
-                                    error!("transcription failed: {e:#}");
-                                    if context.notify_error() {
-                                        send_notification(
-                                            "whisrs",
-                                            &format!("Transcription failed: {e}"),
-                                        );
-                                    }
-                                    Response::Ok { state: new_state }
-                                }
-                            }
+                    let current = ds.state_machine.state();
+                    if current == State::Idle {
+                        // Streaming pipeline already completed the transition
+                        // (auto-stop or normal completion).
+                        match result {
+                            Ok(_) => Response::Ok { state: State::Idle },
+                            Err(e) => Response::Error {
+                                message: e.to_string(),
+                            },
                         }
-                        Err(e) => Response::Error {
-                            message: e.to_string(),
-                        },
+                    } else {
+                        match ds.state_machine.transition(Action::TranscriptionDone) {
+                            Ok(new_state) => {
+                                // Broadcast idle state for tray.
+                                let _ = context.state_tx.send(new_state);
+                                if let Some(level_tx) = &context.overlay_level_tx {
+                                    let _ = level_tx.send(0.0);
+                                }
+                                match result {
+                                    Ok(text) => {
+                                        info!("transcription complete: {} chars", text.len());
+                                        if !text.is_empty() {
+                                            save_history_entry(
+                                                &text,
+                                                &context.config.general.backend,
+                                                &context.config.general.language,
+                                                duration_secs,
+                                            );
+                                        }
+                                        if context.config.general.audio_feedback {
+                                            feedback::play_done(
+                                                context.config.general.audio_feedback_volume,
+                                            );
+                                        }
+                                        if context.notify_state() {
+                                            let preview = truncate_preview(&text, 77);
+                                            send_notification("whisrs", &format!("Done: {preview}"));
+                                        }
+                                        Response::Ok { state: new_state }
+                                    }
+                                    Err(e) => {
+                                        error!("transcription failed: {e:#}");
+                                        if context.notify_error() {
+                                            send_notification(
+                                                "whisrs",
+                                                &format!("Transcription failed: {e}"),
+                                            );
+                                        }
+                                        Response::Ok { state: new_state }
+                                    }
+                                }
+                            }
+                            Err(e) => Response::Error {
+                                message: e.to_string(),
+                            },
+                        }
                     }
                 }
                 Err(e) => Response::Error {
