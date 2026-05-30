@@ -11,6 +11,14 @@
 
 set -euo pipefail
 
+# Some distros (e.g. Debian multiarch) install pkg-config files under a
+# non-default path. Detect and export so the build can find system libraries
+# (alsa, xkbcommon, etc.).
+if [ -d /usr/lib/x86_64-linux-gnu/pkgconfig ] && \
+   [ -z "${PKG_CONFIG_PATH:-}" ]; then
+    export PKG_CONFIG_PATH="/usr/lib/x86_64-linux-gnu/pkgconfig"
+fi
+
 GREEN='\033[32m'
 YELLOW='\033[33m'
 RED='\033[31m'

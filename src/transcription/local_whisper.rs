@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use asr_dedup::TextDedup;
+use asr_dedup::remove_overlap;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -27,6 +27,12 @@ const STEP_SAMPLES: usize = STEP_SECS * SAMPLE_RATE;
 /// Shorter initial window for faster first result.
 const INITIAL_WINDOW_SECS: usize = 4;
 const INITIAL_WINDOW_SAMPLES: usize = INITIAL_WINDOW_SECS * SAMPLE_RATE;
+
+/// Maximum prompt length (chars) fed to whisper as `initial_prompt`.
+/// Longer prompts cause whisper to "predict" upcoming words instead of
+/// transcribing from audio. ~80 chars gives enough context for consistency
+/// without enabling prediction.
+const MAX_PROMPT_CHARS: usize = 80;
 
 /// Silence threshold — must match or be below the daemon's auto-stop threshold
 /// (0.003) so we never skip windows that auto-stop considers speech.
@@ -65,6 +71,56 @@ impl LocalWhisperBackend {
         whisper_rs::WhisperContext::new_with_params(path, params)
             .map_err(|e| anyhow::anyhow!("failed to initialize whisper context: {e}"))
     }
+}
+
+/// Strip hallucination tokens that whisper.cpp models sometimes emit for
+/// silence and non-speech audio (e.g. `[BLANK_AUDIO]`, `[COUGH]`). These
+/// degrade dedup accuracy and pollute the transcription.
+fn strip_whisper_tokens(text: &str) -> String {
+    /// Known whisper hallucination tokens (handled case-insensitively).
+    const TOKENS: &[&str] = &[
+        "[BLANK_AUDIO]",
+        "[SILENCE]",
+        "[INAUDIBLE]",
+        "[MUSIC]",
+        "[NOISE]",
+        "[COUGH]",
+        "[SNEEZE]",
+        "[LAUGH]",
+        "[APPLAUSE]",
+        "[NO_SPEECH]",
+        "[UNKNOWN]",
+        "[STATIC]",
+        "[BEEP]",
+        "[SPEECH]",
+    ];
+
+    let mut result = text.to_string();
+    for token in TOKENS {
+        result = result.replace(&token.to_uppercase(), " ");
+        if *token != token.to_lowercase() {
+            result = result.replace(&token.to_lowercase(), " ");
+        }
+    }
+
+    result
+        .split_whitespace()
+        .collect::<Vec<&str>>()
+        .join(" ")
+}
+
+/// Return the last `max_chars` characters of `s`, rounding down to the nearest
+/// UTF-8 char boundary so we never split a multi-byte codepoint.
+fn truncate_tail(s: &str, max_chars: usize) -> &str {
+    if s.len() <= max_chars {
+        return s;
+    }
+    let target = s.len() - max_chars;
+    let mut i = target;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    &s[i..]
 }
 
 /// Convert i16 PCM samples to f32 in the range [-1.0, 1.0].
@@ -175,12 +231,16 @@ impl TranscriptionBackend for LocalWhisperBackend {
             .ok_or_else(|| anyhow::anyhow!("whisper model not loaded from {}", self.model_path))?;
 
         let mut buffer: Vec<i16> = Vec::new();
-        let mut dedup = TextDedup::new();
+        let mut running_transcript = String::new();
         let mut next_process_at = INITIAL_WINDOW_SAMPLES;
         let mut last_processed_end: usize = 0;
-        // Previous full transcription fed as prompt to the next window.
-        // Seed with vocabulary prompt if available.
-        let mut prompt = config.prompt.clone().unwrap_or_default();
+        // Short prompt for whisper to prevent prediction. ~80 chars gives
+        // enough context for consistent output without hallucinating ahead.
+        let mut prompt = truncate_tail(
+            config.prompt.as_deref().unwrap_or(""),
+            MAX_PROMPT_CHARS,
+        )
+        .to_string();
 
         while let Some(chunk) = audio_rx.recv().await {
             buffer.extend_from_slice(&chunk);
@@ -218,14 +278,21 @@ impl TranscriptionBackend for LocalWhisperBackend {
                     .await
                     {
                         Ok(Ok(full_text)) => {
-                            // Update prompt with this window's full transcription.
-                            if !full_text.is_empty() {
-                                prompt.clone_from(&full_text);
+                            let stripped = strip_whisper_tokens(&full_text);
+                            if !stripped.is_empty() {
+                                prompt = truncate_tail(&stripped, MAX_PROMPT_CHARS).to_string();
                             }
-                            // Use text-based dedup to extract only the new portion.
-                            let new_text = dedup.filter_text(&full_text);
+                            let new_text = if running_transcript.is_empty() {
+                                stripped.clone()
+                            } else {
+                                remove_overlap(&running_transcript, &stripped)
+                            };
                             if !new_text.trim().is_empty() {
                                 debug!("streaming window produced: {:?}", new_text);
+                                if !running_transcript.is_empty() {
+                                    running_transcript.push(' ');
+                                }
+                                running_transcript.push_str(&new_text);
                                 text_tx.send(new_text).await.ok();
                             }
                         }
@@ -270,8 +337,17 @@ impl TranscriptionBackend for LocalWhisperBackend {
                 .await
                 {
                     Ok(Ok(full_text)) => {
-                        let new_text = dedup.filter_text(&full_text);
+                        let stripped = strip_whisper_tokens(&full_text);
+                        let new_text = if running_transcript.is_empty() {
+                            stripped.clone()
+                        } else {
+                            remove_overlap(&running_transcript, &stripped)
+                        };
                         if !new_text.trim().is_empty() {
+                            if !running_transcript.is_empty() {
+                                running_transcript.push(' ');
+                            }
+                            running_transcript.push_str(&new_text);
                             text_tx.send(new_text).await.ok();
                         }
                     }

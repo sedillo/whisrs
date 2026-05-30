@@ -244,7 +244,7 @@ fn floor_char_boundary(s: &str, index: usize) -> usize {
 ///    matches the start of `new`.
 ///
 /// Falls back to returning the full `new` text if no overlap is found.
-pub(crate) fn remove_overlap(previous: &str, new: &str) -> String {
+pub fn remove_overlap(previous: &str, new: &str) -> String {
     let prev_words: Vec<&str> = previous.split_whitespace().collect();
     let new_words: Vec<&str> = new.split_whitespace().collect();
 
